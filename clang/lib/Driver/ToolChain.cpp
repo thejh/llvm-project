@@ -974,7 +974,8 @@ SanitizerMask ToolChain::getSupportedSanitizers() const {
                       SanitizerKind::FloatDivideByZero |
                       SanitizerKind::UnsignedIntegerOverflow |
                       SanitizerKind::ImplicitConversion |
-                      SanitizerKind::Nullability | SanitizerKind::LocalBounds;
+                      SanitizerKind::Nullability | SanitizerKind::LocalBounds |
+                      SanitizerKind::Kernel;
   if (getTriple().getArch() == llvm::Triple::x86 ||
       getTriple().getArch() == llvm::Triple::x86_64 ||
       getTriple().getArch() == llvm::Triple::arm ||
