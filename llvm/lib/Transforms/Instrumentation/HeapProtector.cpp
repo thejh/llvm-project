@@ -70,6 +70,17 @@
 
 using namespace llvm;
 
+static cl::opt<uint32_t> PercpuPinHeadOffset(
+    "heap-protector-percpu-offset",
+    cl::desc(
+        "Override the location of the pin list head in the percpu segment"),
+    cl::init(0x20));
+static cl::opt<uint32_t> PercpuPinHeadAS(
+    "heap-protector-percpu-as",
+    cl::desc(
+        "Override the address space number used for percpu addressing"),
+    cl::init(256));
+
 #define DEBUG_TYPE "ksan"
 
 namespace {
@@ -110,6 +121,7 @@ public:
   static char ID;  // Pass identification, replacement for typeid
 
 private:
+  Function *Func;
   Module *M;
 
   //DenseSet<pair<Value*, BasicBlock*>> DecodedInParent;
@@ -122,6 +134,7 @@ private:
     >
   > DecodedUsers;
   DenseSet<Value*> DecodedUseRoots;
+  SmallVector<Use*, 8> FramePinArgs;
 
   bool needsDecoding(Use* AddressUse);
   void markOperandDecoded(Instruction *I, int Index);
@@ -239,6 +252,17 @@ void HeapProtector::markOperandDecoded(Instruction *I, int Index) {
 
   if (!needsDecoding(AddressUse))
     return;
+
+  if (CallInst *CI = dyn_cast<CallInst>(I)) {
+    /*
+     * Any function call that gets a KHP-decoded pointer as argument definitely
+     * must not be turned into a tail call.
+     * (But this probably can't happen anyway, since we have a volatile store
+     * afterwards.)
+     */
+    CI->setTailCallKind(llvm::CallInst::TCK_NoTail);
+  }
+
   if (DecodedUsers[AddressUse->get()].count(AddressUse) == 1)
     return;
   Value *UnderlyingObject = UnderlyingHeapObject(AddressUse, &DecodedUsers, nullptr);
@@ -360,8 +384,10 @@ void HeapProtector::findPtrSinks(Instruction *I) {
 
 Value *HeapProtector::decodePtr(IRBuilder<> &IRB, Value *Ptr) {
   Type *Int8PtrTy = IRB.getInt8PtrTy();
+  PointerType *Int8PtrPtrTy = Int8PtrTy->getPointerTo(0);
 
-  FunctionCallee DecodePtrCallee = M->getOrInsertFunction("__khp_decode_ptr", Int8PtrTy, Int8PtrTy);
+  // void *__khp_decode_ptr(void *encoded_ptr, void **stack_pin_slot)
+  FunctionCallee DecodePtrCallee = M->getOrInsertFunction("__khp_decode_ptr", Int8PtrTy, Int8PtrTy, Int8PtrPtrTy);
   Value *DecodePtrFnVal = DecodePtrCallee.getCallee()->stripPointerCasts();
   Function *DecodePtrFn = cast<Function>(DecodePtrFnVal);
 
@@ -383,8 +409,10 @@ Value *HeapProtector::decodePtr(IRBuilder<> &IRB, Value *Ptr) {
 
   Value *PtrCasted = IRB.CreatePointerCast(Ptr, Int8PtrTy);
   CallInst *DecodeCall = IRB.CreateCall(DecodePtrFn, {
-    PtrCasted
+    PtrCasted,
+    ConstantPointerNull::get(Int8PtrPtrTy)
   });
+  FramePinArgs.append({&DecodeCall->getOperandUse(1)});
   Value* NewPtr = IRB.CreatePointerCast(DecodeCall, Ptr->getType(), Ptr->getName()+"_decoded");
 
   return NewPtr;
@@ -412,6 +440,7 @@ Value *HeapProtector::decodePtrAtSource(Value *Ptr) {
 }
 
 bool HeapProtector::runOnFunction(Function &F) {
+  Func = &F;
 
   DenseMap<Value*, Value*> DecodedOutputs;
   /*
@@ -422,6 +451,7 @@ bool HeapProtector::runOnFunction(Function &F) {
 
   DecodedUsers.clear();
   DecodedUseRoots.clear();
+  FramePinArgs.clear();
 
 #if DEBUG_PRINT
   if (F.getName().startswith(debug_function)) {
@@ -498,6 +528,110 @@ bool HeapProtector::runOnFunction(Function &F) {
       assert(u_decoded->get() == V);
       u_decoded->set(v_decoded);
     }
+  }
+
+  size_t pin_count = FramePinArgs.size();
+  assert(pin_count != 0);
+  IRBuilder<> IRB_entry(&Func->getEntryBlock(), Func->getEntryBlock().getFirstInsertionPt());
+
+  /*
+   * percpu_pin_head is a percpu variable; locate it in a target-specific way.
+   */
+  Constant *PercpuPinHead;
+  if (Triple(M->getTargetTriple()).getArch() == Triple::ArchType::x86_64) {
+    PercpuPinHead = ConstantExpr::getIntToPtr(
+        IRB_entry.getInt32(PercpuPinHeadOffset),
+        IRB_entry.getInt8PtrTy()->getPointerTo(PercpuPinHeadAS));
+  } else {
+    report_fatal_error("unsupported architecture");
+  }
+
+  /*
+   * Allocate a structure like this on the stack:
+   *     struct pins_frame {
+   *       void *previous_frame;
+   *       ptrsize_t pins_count;
+   *       void *pins[pin_count];
+   *     } __khp_frame_pin_area;
+   */
+  unsigned ptr_size = M->getDataLayout().getPointerTypeSize(IRB_entry.getInt8PtrTy());
+  unsigned pins_size = pin_count * ptr_size;
+  Type *AllocaTy = ArrayType::get(IRB_entry.getInt8PtrTy(), pin_count + 2);
+  AllocaInst *FramePinArea = IRB_entry.CreateAlloca(AllocaTy, nullptr, "__khp_frame_pin_area");
+  Value *PrevFramePtr = IRB_entry.CreateGEP(FramePinArea, {
+    IRB_entry.getInt32(0),
+    IRB_entry.getInt32(0)
+  }, "prev_frame_ptr");
+  Value *PinsCountPtr = IRB_entry.CreateGEP(FramePinArea, {
+    IRB_entry.getInt32(0),
+    IRB_entry.getInt32(1)
+  }, "pins_count_ptr");
+
+  /* memset(__khp_frame_pin_area.pins, 0, sizeof(__khp_frame_pin_area.pins)) */
+  Value *PinAreaPins = IRB_entry.CreateGEP(FramePinArea, {
+    IRB_entry.getInt32(0),
+    IRB_entry.getInt32(2)
+  }, "frame_pin_area_pins");
+  IRB_entry.CreateMemSet(PinAreaPins, IRB_entry.getInt8(0), pins_size, MaybeAlign(None));
+  /* pins_frame.previous_frame = percpu_pin_head */
+  IRB_entry.CreateStore(
+    IRB_entry.CreateLoad(
+      IRB_entry.getInt8PtrTy(),
+      PercpuPinHead,
+      "old_percpu_pin_head"
+    ),
+    PrevFramePtr
+  );
+  /* pins_frame.pins_count = (void*){pin_count} */
+  IRB_entry.CreateStore(
+    ConstantExpr::getIntToPtr(
+      IRB_entry.getInt32(pin_count),
+      IRB_entry.getInt8PtrTy()
+    ),
+    PinsCountPtr
+  );
+  /*
+   * percpu_pin_head = &pins_frame
+   * (pins_frame must be fully initialized at this point, in case an interrupt
+   * arrives right after this store)
+   */
+  IRB_entry.CreateStore(
+    IRB_entry.CreatePointerCast(FramePinArea, IRB_entry.getInt8PtrTy()),
+    PercpuPinHead,
+    true /* must be volatile so that all preceding stores always happen */
+  )->setAtomic(AtomicOrdering::Unordered);
+
+  /* On exit, restore the old frame pin stack state. */
+  for (auto &BB : F) {
+    Instruction *Terminator = BB.getTerminator();
+    if (!isa<ReturnInst>(Terminator))
+      continue;
+    IRBuilder<> IRB_exit(Terminator);
+
+    /* percpu_pin_head = pins_frame.previous_frame */
+    IRB_exit.CreateStore(
+      IRB_exit.CreateLoad(
+        IRB_exit.getInt8PtrTy(),
+        PrevFramePtr,
+        "old_percpu_pin_head"
+      ),
+      PercpuPinHead,
+      true
+    )->setAtomic(AtomicOrdering::Unordered);
+  }
+
+  /*
+   * Turn the `__khp_decode_ptr({encoded_ptr}, NULL)` calls we created earlier
+   * into `__khp_decode_ptr({encoded_ptr}, &__khp_frame_pin_area.pins[i])`.
+   */
+  unsigned FramePinIdx = 0;
+  for (Use *FramePinArg: FramePinArgs) {
+    Value *Slot = IRB_entry.CreateGEP(FramePinArea, {
+      IRB_entry.getInt32(0),
+      IRB_entry.getInt32(FramePinIdx + 2)
+    }, "frame_pin_area_slot");
+    FramePinArg->set(Slot);
+    FramePinIdx++;
   }
 
 #if DEBUG_PRINT
