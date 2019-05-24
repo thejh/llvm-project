@@ -440,6 +440,7 @@ Value *HeapProtector::decodePtrAtSource(Value *Ptr) {
 }
 
 bool HeapProtector::runOnFunction(Function &F) {
+  LLVMContext &C = F.getContext();
   Func = &F;
 
   DenseMap<Value*, Value*> DecodedOutputs;
@@ -558,6 +559,7 @@ bool HeapProtector::runOnFunction(Function &F) {
   unsigned pins_size = pin_count * ptr_size;
   Type *AllocaTy = ArrayType::get(IRB_entry.getInt8PtrTy(), pin_count + 2);
   AllocaInst *FramePinArea = IRB_entry.CreateAlloca(AllocaTy, nullptr, "__khp_frame_pin_area");
+  FramePinArea->setMetadata("no_stack_protector_needed", MDNode::get(C, {}));
   Value *PrevFramePtr = IRB_entry.CreateGEP(FramePinArea, {
     IRB_entry.getInt32(0),
     IRB_entry.getInt32(0)

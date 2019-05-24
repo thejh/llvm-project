@@ -303,6 +303,13 @@ bool StackProtector::RequiresStackProtector() {
   for (const BasicBlock &BB : *F) {
     for (const Instruction &I : BB) {
       if (const AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
+        /*
+         * Passes that add stack allocations that are known to be safe against
+         * overflows can opt out of stack protection.
+         */
+        if (AI->getMetadata("no_stack_protector_needed") != nullptr)
+          continue;
+
         if (AI->isArrayAllocation()) {
           auto RemarkBuilder = [&]() {
             return OptimizationRemark(DEBUG_TYPE, "StackProtectorAllocaOrArray",
