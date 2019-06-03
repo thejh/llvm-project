@@ -123,6 +123,7 @@ public:
 private:
   Function *Func;
   Module *M;
+  Function *KhpUnsafeDecodePseudoFn;
 
   //DenseSet<pair<Value*, BasicBlock*>> DecodedInParent;
 
@@ -236,6 +237,15 @@ bool HeapProtector::needsDecoding(Use* AddressUse) {
   if (isa<AllocaInst>(UnderlyingInsn))
     return false;
 
+  // If this is a "everything below here must be decoded" marker, it's going to
+  // be decoded anyway, and the "root" will be deleted.
+  if (CallInst *Call = dyn_cast<CallInst>(UnderlyingInsn)) {
+    if (Function* Callee = Call->getCalledFunction()) {
+      if (Callee == KhpUnsafeDecodePseudoFn && Call->getNumArgOperands() == 1)
+        return false;
+    }
+  }
+
   // TODO: need to think about what happens with objects aliased by virtue of
   // PtrToInt or BitCast.
 
@@ -339,6 +349,8 @@ void HeapProtector::findPtrSinksInCall(Instruction *I) {
         markOperandDecoded(I, 1);
       } else if (Name == "memset") {
         markOperandDecoded(I, 0);
+      } else if (Callee == KhpUnsafeDecodePseudoFn && Call->getNumArgOperands() == 1) {
+        // don't mark as decoded here - we're about to delete the instruction
       }
     }
   }
@@ -442,6 +454,8 @@ Value *HeapProtector::decodePtrAtSource(Value *Ptr) {
 bool HeapProtector::runOnFunction(Function &F) {
   LLVMContext &C = F.getContext();
   Func = &F;
+  M = F.getParent();
+  KhpUnsafeDecodePseudoFn = M->getFunction("__khp_unsafe_decode");
 
   DenseMap<Value*, Value*> DecodedOutputs;
   /*
@@ -462,12 +476,39 @@ bool HeapProtector::runOnFunction(Function &F) {
   //debug_printing = true;
 #endif
 
-  M = F.getParent();
-
+  SmallVector<Instruction*, 0> DeleteInsns;
   for (auto &BB : F) {
     for (auto &I : BB) {
       debug_print(errs() << "   ### LOOKING AT: "; I.print(errs()); errs() << "\n";)
       findPtrSinks(&I);
+    }
+  }
+
+  /* turn explicit "this pointer needs to be decoded" markers into casts */
+  DenseSet<Value*> ForceDecodePassthroughs;
+  if (KhpUnsafeDecodePseudoFn != nullptr) {
+    SmallVector<Instruction*, 0> DeleteInsns;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        CallInst *Call = dyn_cast<CallInst>(&I);
+        if (Call == nullptr) continue;
+        Function* Callee = Call->getCalledFunction();
+        if (Callee != KhpUnsafeDecodePseudoFn) continue;
+        if (Call->getNumArgOperands() != 1) continue; /* maybe emit diagnostic? */
+        Value *Ptr = Call->getArgOperand(0);
+        // Always generate a cast, even if it is redundant; we will abuse it as
+        // our anchor for decoding.
+        Instruction *PtrCast = CastInst::Create(Instruction::CastOps::BitCast, Ptr, Call->getType());
+        PtrCast->insertBefore(Call);
+        markOperandDecoded(PtrCast, 0);
+        Call->replaceAllUsesWith(PtrCast);
+        DeleteInsns.append(1, Call);
+        ForceDecodePassthroughs.insert(PtrCast);
+      }
+    }
+    /* do this after the loop to avoid iterator invalidation issues */
+    for (Instruction *I: DeleteInsns) {
+      I->eraseFromParent();
     }
   }
 
@@ -500,10 +541,17 @@ bool HeapProtector::runOnFunction(Function &F) {
      * ***recursively for every passthrough***.
      * For now, just always duplicate passthrough instructions and let LLVM
      * sort out the dead code.
+     * However, as an exception, forcibly decoded instructions are updated
+     * directly.
      */
-    assert(!isa<LoadInst>(I));
-    Instruction *NI = I->clone();
-    NI->insertAfter(I);
+    Instruction *NI;
+    if (ForceDecodePassthroughs.count(I)) {
+      NI = I;
+    } else {
+      assert(!isa<LoadInst>(I));
+      NI = I->clone();
+      NI->insertAfter(I);
+    }
     DecodedInputs[V] = NI;
     DecodedOutputs[V] = NI;
     assert(V->getType() == NI->getType());
