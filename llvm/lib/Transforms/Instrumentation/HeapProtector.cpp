@@ -267,8 +267,29 @@ static std::vector<int> &get_insn_arg_info(unsigned opcode) {
 void HeapProtector::findPtrSinksInCall(Instruction *I) {
   CallInst *Call = cast<CallInst>(I);
 
-  if (Call->isInlineAsm())
+  if (InlineAsm *Asm = dyn_cast<InlineAsm>(Call->getCalledOperand())) {
+    // LLVM mixes calls and inline asm in its IR, but they're very different.
+    InlineAsm::ConstraintInfoVector Constraints = Asm->ParseConstraints();
+    int ArgIdx = -1;
+    for (unsigned OperandNo=0; OperandNo<Constraints.size(); OperandNo++) {
+      InlineAsm::ConstraintInfo &info = Constraints[OperandNo];
+
+      // Direct outputs and clobbers don't come with arguments.
+      bool IsWrite = info.Type == InlineAsm::ConstraintPrefix::isOutput;
+      if (IsWrite && !info.isIndirect)
+        continue;
+      if (info.Type == InlineAsm::ConstraintPrefix::isClobber)
+        continue;
+      ArgIdx++;
+
+      // We overload the meaning of indirect asm operands and assume that they
+      // are always non-escaping, valid pointers.
+      if (!info.isIndirect) continue;
+
+      markOperandDecoded(Call, ArgIdx);
+    }
     return;
+  }
 
   if (Function* Callee = Call->getCalledFunction()) {
     if (Callee->isIntrinsic()) {
