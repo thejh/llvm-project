@@ -289,6 +289,11 @@ static void addKernelAddressSanitizerPasses(const PassManagerBuilder &Builder,
 static void addHeapProtectorPasses(const PassManagerBuilder &Builder,
                                      legacy::PassManagerBase &PM) {
   PM.add(createHeapProtectorFunctionPass());
+  /*
+   * HeapProtector is experimental code; avoid letting its mistakes bleed into
+   * later passes.
+   */
+  PM.add(createVerifierPass());
 
   if (Builder.OptLevel > 0) {
     PM.add(createEarlyCSEPass());

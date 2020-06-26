@@ -451,6 +451,48 @@ Value *HeapProtector::decodePtrAtSource(Value *Ptr) {
   }
 }
 
+/*
+ * Can we loop from @Start back to @Start without going through @Excluded?
+ * Or in other words, can moving code from @Excluded to @Start make it run
+ * more often?
+ * Note: This is O(number_of_basic_blocks), and in a worst case scenario this
+ * helper may be called once per instruction or so, so this effectively makes
+ * things O(N^2). It's probably going to be fine though... right?
+ * There's probably some fancy compiler algorithm to do this more elegantly...
+ */
+static bool CanLoopWhileExcluding(BasicBlock *Start, BasicBlock *Excluded) {
+  /* BBs which should not be newly queued when seen */
+  DenseSet<BasicBlock*> Seen = {Excluded};
+  /* BBs to look at */
+  DenseSet<BasicBlock*> Queue = {Start};
+  while (!Queue.empty()) {
+    auto QI = Queue.begin();
+    BasicBlock *B = *QI;
+    Queue.erase(QI);
+
+    Instruction *T = B->getTerminator();
+    unsigned NumSucc = T->getNumSuccessors();
+    for (unsigned i=0; i<NumSucc; i++) {
+      BasicBlock *Succ = T->getSuccessor(i);
+      if (Succ == Start)
+        return true;
+      if (!Seen.insert(Succ).second)
+        continue; /* already seen */
+      Queue.insert(Succ);
+    }
+  }
+  return false;
+}
+
+static FunctionCallee CreateLoadHelperFn(Module *M, const char *Name, Type *T) {
+  FunctionCallee Callee = M->getOrInsertFunction(Name, T, T->getPointerTo(0));
+  Function *F = cast<Function>(Callee.getCallee()->stripPointerCasts());
+  F->setOnlyReadsMemory();
+  F->setDoesNotThrow();
+  F->setCallingConv(CallingConv::PreserveMost);
+  return Callee;
+}
+
 bool HeapProtector::runOnFunction(Function &F) {
   LLVMContext &C = F.getContext();
   Func = &F;
@@ -517,6 +559,147 @@ bool HeapProtector::runOnFunction(Function &F) {
     debug_printing = false;
 #endif
     return false;
+  }
+
+  /* for each root, figure out whether it will only be used for a single load */
+  DenseSet<std::pair<LoadInst *, Value *>> ElisionFixup;
+  for (Value *Root: DecodedUseRoots) {
+    Value *V = Root;
+    DenseSet<Value *> DecodeElidedValues;
+    while (1) {
+      if (DecodedUsers.count(V) == 0) {
+        assert(V != Root);
+        break;
+      }
+      DenseSet<Use*> &Users = DecodedUsers[V];
+      assert(Users.size() != 0);
+      if (Users.size() != 1)
+        goto try_next_root;
+      DecodeElidedValues.insert(V);
+      V = (*Users.begin())->getUser();
+      if (ForceDecodePassthroughs.count(V))
+        goto try_next_root;
+      if (DecodedUseRoots.count(V) == 1)
+        break;
+    }
+
+    if (LoadInst *LI = dyn_cast<LoadInst>(V)) {
+      debug_print(errs() << "single-user load: from `" << *Root << "` to `" << *V << "`\n";)
+      BasicBlock *RootBB;
+      if (Argument *RootArg = dyn_cast<Argument>(Root)) {
+        RootBB = &Func->getEntryBlock();
+      } else {
+        Instruction *RootInsn = cast<Instruction>(Root);
+        RootBB = RootInsn->getParent();
+      }
+      if (LI->getParent() == RootBB) {
+        debug_print(errs() << "  same-BB case (simplify)\n";)
+      } else {
+        if (CanLoopWhileExcluding(LI->getParent(), RootBB)) {
+          debug_print(errs() << "  can loop (don't simplify)\n";)
+          goto try_next_root;
+        } else {
+          debug_print(errs() << "  can't loop (simplify)\n";)
+        }
+      }
+
+      /*
+       * Alright, we have a single decode leading to a single non-repeated load.
+       * This calls for simplification - provided that the load is of a size we
+       * support, and it's not weird in any way (volatile loads are fine, but
+       * atomic ones are not).
+       * TODO bail out on unaligned access if required by the architecture - not
+       * necessary for X86/ARM64, we have fast unaligned access there.
+       */
+      if (LI->getOrdering() != AtomicOrdering::NotAtomic) {
+        debug_print(errs() << "  kinda atomic (bailout)\n";)
+        goto try_next_root;
+      }
+      Type *LVType = LI->getType();
+      if (!isa<IntegerType>(LVType) && !isa<PointerType>(LVType)) {
+        debug_print(errs() << "  non-integer, non-pointer type (bailout)\n";)
+        goto try_next_root;
+      }
+      uint64_t LVSize = M->getDataLayout().getTypeSizeInBits(LVType).getFixedSize();
+
+      FunctionCallee LoadCallee;
+      switch (LVSize) {
+        case 8:
+          LoadCallee = CreateLoadHelperFn(M, "__khp_load_1", Type::getInt8Ty(C));
+          break;
+        case 16:
+          LoadCallee = CreateLoadHelperFn(M, "__khp_load_2", Type::getInt16Ty(C));
+          break;
+        case 32:
+          LoadCallee = CreateLoadHelperFn(M, "__khp_load_4", Type::getInt32Ty(C));
+          break;
+        case 64:
+          LoadCallee = CreateLoadHelperFn(M, "__khp_load_8", Type::getInt64Ty(C));
+          break;
+        default:
+          debug_print(errs() << "  unsupported size " << LVSize << " of type " << *LVType << " (bailout)\n";)
+          goto try_next_root;
+      }
+
+      /*
+       * Everything looks good, we're committed now. Suppress the normal
+       * decoding logic: Unregister the root and the decoded-dependency edges
+       * chaining it to the LoadInst.
+       */
+      DecodedUseRoots.erase(Root);
+      for (Value *ElidedValue: DecodeElidedValues) {
+        assert(DecodedUsers[ElidedValue].size() == 1);
+        DecodedUsers.erase(ElidedValue);
+      }
+
+      IRBuilder<> IRB(LI);
+      Function *LoadFn = cast<Function>(LoadCallee.getCallee()->stripPointerCasts());
+      Value *PtrCasted = IRB.CreatePointerCast(
+        LI->getPointerOperand(),
+        LoadFn->getArg(0)->getType()
+      );
+      CallInst *LoadCall = IRB.CreateCall(LoadCallee, { PtrCasted });
+      Value *ValueCasted = IRB.CreateBitOrPointerCast(
+        LoadCall,
+        LI->getType()
+      );
+
+      /*
+       * Do the rest later to avoid iterator invalidation issues.
+       */
+      ElisionFixup.insert(std::pair<LoadInst*,Value*>(LI, ValueCasted));
+    }
+
+try_next_root:;
+  }
+  for (std::pair<LoadInst*, Value*> ElisionMapping: ElisionFixup) {
+    LoadInst *LI = ElisionMapping.first;
+    Value *ValueCasted = ElisionMapping.second;
+    if (DecodedUseRoots.count(LI) != 0) {
+      DecodedUseRoots.erase(LI);
+      DecodedUseRoots.insert(ValueCasted);
+
+      DenseSet<Use*> Users = DecodedUsers[LI];
+      DecodedUsers.erase(LI);
+      DecodedUsers.insert(std::pair<Value*,DenseSet<Use*>>(ValueCasted, Users));
+    }
+
+    /* Hook up the load's dependencies, and get rid of the original load. */
+    LI->replaceAllUsesWith(ValueCasted);
+    LI->eraseFromParent();
+  }
+
+  /*
+   * Recheck whether the optimization above has gotten rid of all the roots; in
+   * that case, we want to bail out here to avoid creating the stack pin area
+   * and so on. (But we have to return that we've changed the function in that
+   * case.)
+   */
+  if (DecodedUseRoots.empty()) {
+#if DEBUG_PRINT
+    debug_printing = false;
+#endif
+    return true;
   }
 
   /* decode root values */
