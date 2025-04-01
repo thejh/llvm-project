@@ -4506,7 +4506,8 @@ public:
                   ReturnValueSlot ReturnValue, const CallArgList &Args,
                   llvm::CallBase **CallOrInvoke, bool IsMustTail,
                   SourceLocation Loc,
-                  bool IsVirtualFunctionPointerThunk = false);
+                  bool IsVirtualFunctionPointerThunk = false,
+                  QualType HeapAllocSiteType = QualType());
   RValue EmitCall(const CGFunctionInfo &CallInfo, const CGCallee &Callee,
                   ReturnValueSlot ReturnValue, const CallArgList &Args,
                   llvm::CallBase **CallOrInvoke = nullptr,

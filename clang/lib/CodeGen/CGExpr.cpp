@@ -6308,6 +6308,44 @@ LValue CodeGenFunction::EmitStmtExprLValue(const StmtExpr *E) {
                         AlignmentSource::Decl);
 }
 
+// could instead try to build something on ConstStmtVisitor
+static QualType InferTypeFromSizeExpr(ASTContext &Ctx, const Expr *E) {
+  if (const UnaryExprOrTypeTraitExpr *TE = dyn_cast<UnaryExprOrTypeTraitExpr>(E)) {
+    if (TE->getKind() == UETT_SizeOf) {
+      return TE->getTypeOfArgument();
+    }
+  } else if (const CastExpr *CE = dyn_cast<CastExpr>(E)) {
+    return InferTypeFromSizeExpr(Ctx, CE->getSubExpr());
+  } else if (const BinaryOperator *BO = dyn_cast<BinaryOperator>(E)) {
+    if (BO->getOpcode() == BO_Mul) {
+      // multiplication implies array allocation
+
+      Expr *a = BO->getLHS();
+      Expr *b = BO->getRHS();
+      QualType a_type = InferTypeFromSizeExpr(Ctx, a);
+      QualType b_type = InferTypeFromSizeExpr(Ctx, b);
+      if (a_type.isNull() && !b_type.isNull()) {
+        std::swap(a, b);
+        std::swap(a_type, b_type);
+      }
+      if (!a_type.isNull() && b_type.isNull()) {
+        return Ctx.getIncompleteArrayType(a_type, ArraySizeModifier::Normal, 0);
+      }
+    }
+/*
+  } else if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E)) {
+    ValueDecl *D = DRE->getDecl();
+    if (VarDecl *VD = dyn_cast_if_present<VarDecl>(D)) {
+      if (!VD.isLocalVarDeclOrParm())
+        return QualType();
+      if (!VD.getType().isConstQualified())
+        return QualType();
+    }
+*/
+  }
+  return QualType();
+}
+
 RValue CodeGenFunction::EmitCall(QualType CalleeType,
                                  const CGCallee &OrigCallee, const CallExpr *E,
                                  ReturnValueSlot ReturnValue,
@@ -6515,9 +6553,21 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
         Address(Handle, Handle->getType(), CGM.getPointerAlign()));
     Callee.setFunctionPointer(Stub);
   }
+
+  QualType HeapAllocSiteType = QualType();
+  if (getDebugInfo()) {
+    if (auto *AllocSize = TargetDecl->getAttr<AllocSizeAttr>()) {
+      // only use the element size parameter for now
+      unsigned SizeArgNo = AllocSize->getElemSizeParam().getASTIndex();
+      if (SizeArgNo < E->getNumArgs())
+        HeapAllocSiteType = InferTypeFromSizeExpr(getContext(), E->getArg(SizeArgNo));
+    }
+  }
+
   llvm::CallBase *LocalCallOrInvoke = nullptr;
   RValue Call = EmitCall(FnInfo, Callee, ReturnValue, Args, &LocalCallOrInvoke,
-                         E == MustTailCall, E->getExprLoc());
+                         E == MustTailCall, E->getExprLoc(), false,
+                         HeapAllocSiteType);
 
   // Generate function declaration DISuprogram in order to be used
   // in debug info about call sites.

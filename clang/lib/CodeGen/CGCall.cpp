@@ -5220,7 +5220,8 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
                                  const CallArgList &CallArgs,
                                  llvm::CallBase **callOrInvoke, bool IsMustTail,
                                  SourceLocation Loc,
-                                 bool IsVirtualFunctionPointerThunk) {
+                                 bool IsVirtualFunctionPointerThunk,
+                                 QualType HeapAllocSiteType) {
   // FIXME: We no longer need the types from CallArgs; lift up and simplify.
 
   assert(Callee.isOrdinary() || Callee.isVirtual());
@@ -5989,8 +5990,17 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
   }
 
   // Add metadata for calls to MSAllocator functions
-  if (getDebugInfo() && TargetDecl && TargetDecl->hasAttr<MSAllocatorAttr>())
-    getDebugInfo()->addHeapAllocSiteMetadata(CI, RetTy->getPointeeType(), Loc);
+  if (getDebugInfo()) {
+    if (TargetDecl && TargetDecl->hasAttr<MSAllocatorAttr>())
+      HeapAllocSiteType = RetTy->getPointeeType();
+    if (!HeapAllocSiteType.isNull()) {
+      getDebugInfo()->addHeapAllocSiteMetadata(CI, HeapAllocSiteType, Loc);
+      // Disable tail calls - they prevent the callee from recording the call
+      // site address.
+      if (llvm::CallInst *CallI = dyn_cast<llvm::CallInst>(CI))
+        CallI->setTailCallKind(llvm::CallInst::TCK_NoTail);
+    }
+  }
 
   // Add metadata if calling an __attribute__((error(""))) or warning fn.
   if (TargetDecl && TargetDecl->hasAttr<ErrorAttr>()) {
