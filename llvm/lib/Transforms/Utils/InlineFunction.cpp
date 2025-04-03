@@ -2957,6 +2957,25 @@ llvm::InlineResult llvm::InlineFunction(CallBase &CB, InlineFunctionInfo &IFI,
         // inlining, commonly when the callee is an intrinsic.
         if (MarkNoUnwind && !CI->doesNotThrow())
           CI->setDoesNotThrow();
+
+        // If the inlined function contains an allocator call for which we want
+        // to provide type debuginfo, and the type can only be determined from
+        // the inlined callsite, propagate the type information from
+        // the inlined callsite to the allocator call.
+        if (CI->hasMetadata("heapallocsite-typearg")) {
+          // Start by removing the metadata, whose old reference to an argument
+          // index will become invalid after inlining.
+          CI->setMetadata("heapallocsite-typearg", nullptr);
+
+          // Propagate information from the callsite - ideally a type, but could
+          // also be a reference to an argument of the function we're inlining
+          // into.
+          if (CB.hasMetadata("heapallocsite")) {
+            CI->setMetadata("heapallocsite", CB.getMetadata("heapallocsite"));
+          } else if (CB.hasMetadata("heapallocsite-typearg")) {
+            CI->setMetadata("heapallocsite-typearg", CB.getMetadata("heapallocsite-typearg"));
+          }
+        }
       }
     }
   }

@@ -4507,7 +4507,7 @@ public:
                   llvm::CallBase **CallOrInvoke, bool IsMustTail,
                   SourceLocation Loc,
                   bool IsVirtualFunctionPointerThunk = false,
-                  QualType HeapAllocSiteType = QualType());
+                  QualType HeapAllocSiteType = QualType(), int HeapAllocSiteTypeArg = -1);
   RValue EmitCall(const CGFunctionInfo &CallInfo, const CGCallee &Callee,
                   ReturnValueSlot ReturnValue, const CallArgList &Args,
                   llvm::CallBase **CallOrInvoke = nullptr,

@@ -2822,6 +2822,13 @@ void CGDebugInfo::addHeapAllocSiteMetadata(llvm::CallBase *CI,
   CI->setMetadata("heapallocsite", node);
 }
 
+void CGDebugInfo::addHeapAllocSiteArgMetadata(llvm::CallBase *CI, unsigned ArgIdx) {
+  if (CGM.getCodeGenOpts().getDebugInfo() <=
+      llvm::codegenoptions::DebugLineTablesOnly)
+    return;
+  CI->setMetadata("heapallocsite-typearg", llvm::MDTuple::get(CGM.getLLVMContext(), {llvm::ValueAsMetadata::getConstant(llvm::ConstantInt::get(CGM.getLLVMContext(), llvm::APInt(32, ArgIdx)))}));
+}
+
 void CGDebugInfo::completeType(const EnumDecl *ED) {
   if (DebugKind <= llvm::codegenoptions::DebugLineTablesOnly)
     return;

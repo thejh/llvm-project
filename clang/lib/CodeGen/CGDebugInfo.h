@@ -617,6 +617,8 @@ public:
   void addHeapAllocSiteMetadata(llvm::CallBase *CallSite, QualType AllocatedTy,
                                 SourceLocation Loc);
 
+  void addHeapAllocSiteArgMetadata(llvm::CallBase *CallSite, unsigned ArgIdx);
+
   void completeType(const EnumDecl *ED);
   void completeType(const RecordDecl *RD);
   void completeRequiredType(const RecordDecl *RD);

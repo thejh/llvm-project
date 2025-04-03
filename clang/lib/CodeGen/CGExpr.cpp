@@ -6309,10 +6309,10 @@ LValue CodeGenFunction::EmitStmtExprLValue(const StmtExpr *E) {
 }
 
 // could instead try to build something on ConstStmtVisitor
-static QualType InferTypeFromSizeExpr(ASTContext &Ctx, const Expr *E) {
+static std::pair<QualType,int> InferTypeFromSizeExpr(ASTContext &Ctx, const Expr *E) {
   if (const UnaryExprOrTypeTraitExpr *TE = dyn_cast<UnaryExprOrTypeTraitExpr>(E)) {
     if (TE->getKind() == UETT_SizeOf) {
-      return TE->getTypeOfArgument();
+      return std::make_pair<>(TE->getTypeOfArgument(), -1);
     }
   } else if (const CastExpr *CE = dyn_cast<CastExpr>(E)) {
     return InferTypeFromSizeExpr(Ctx, CE->getSubExpr());
@@ -6322,28 +6322,34 @@ static QualType InferTypeFromSizeExpr(ASTContext &Ctx, const Expr *E) {
 
       Expr *a = BO->getLHS();
       Expr *b = BO->getRHS();
-      QualType a_type = InferTypeFromSizeExpr(Ctx, a);
-      QualType b_type = InferTypeFromSizeExpr(Ctx, b);
-      if (a_type.isNull() && !b_type.isNull()) {
+      std::pair<QualType,int> a_type = InferTypeFromSizeExpr(Ctx, a);
+      std::pair<QualType,int> b_type = InferTypeFromSizeExpr(Ctx, b);
+      if (a_type.first.isNull() && !b_type.first.isNull()) {
         std::swap(a, b);
         std::swap(a_type, b_type);
       }
-      if (!a_type.isNull() && b_type.isNull()) {
-        return Ctx.getIncompleteArrayType(a_type, ArraySizeModifier::Normal, 0);
+      if (!a_type.first.isNull() && b_type.first.isNull()) {
+        return std::make_pair<>(Ctx.getIncompleteArrayType(a_type.first, ArraySizeModifier::Normal, 0), -1);
+      }
+      if (a_type.first.isNull() && b_type.first.isNull()) {
+        int ArgNo = a_type.second == -1 ? b_type.second : a_type.second;
+        if (ArgNo != -1)
+          return std::make_pair<>(QualType(), ArgNo);
       }
     }
-/*
   } else if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E)) {
-    ValueDecl *D = DRE->getDecl();
-    if (VarDecl *VD = dyn_cast_if_present<VarDecl>(D)) {
-      if (!VD.isLocalVarDeclOrParm())
-        return QualType();
-      if (!VD.getType().isConstQualified())
-        return QualType();
+    if (const ParmVarDecl *PVD = dyn_cast_if_present<ParmVarDecl>(DRE->getDecl())) {
+      if (!PVD->getType().isConstQualified())
+        return std::make_pair<>(QualType(), -1);
+      if (const FunctionDecl *FD = dyn_cast<FunctionDecl>(PVD->getDeclContext())) {
+        if (AllocSizeAttr *ASS = FD->getAttr<AllocSizeAttr>()) {
+          if (PVD->getFunctionScopeIndex() == ASS->getElemSizeParam().getASTIndex())
+            return std::make_pair<>(QualType(), PVD->getFunctionScopeIndex());
+        }
+      }
     }
-*/
   }
-  return QualType();
+  return std::make_pair<>(QualType(), -1);
 }
 
 RValue CodeGenFunction::EmitCall(QualType CalleeType,
@@ -6554,8 +6560,8 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
     Callee.setFunctionPointer(Stub);
   }
 
-  QualType HeapAllocSiteType = QualType();
-  if (getDebugInfo()) {
+  std::pair<QualType,int> HeapAllocSiteType = std::make_pair<>(QualType(), -1);
+  if (getDebugInfo() && TargetDecl) {
     if (auto *AllocSize = TargetDecl->getAttr<AllocSizeAttr>()) {
       // only use the element size parameter for now
       unsigned SizeArgNo = AllocSize->getElemSizeParam().getASTIndex();
@@ -6567,7 +6573,7 @@ RValue CodeGenFunction::EmitCall(QualType CalleeType,
   llvm::CallBase *LocalCallOrInvoke = nullptr;
   RValue Call = EmitCall(FnInfo, Callee, ReturnValue, Args, &LocalCallOrInvoke,
                          E == MustTailCall, E->getExprLoc(), false,
-                         HeapAllocSiteType);
+                         HeapAllocSiteType.first, HeapAllocSiteType.second);
 
   // Generate function declaration DISuprogram in order to be used
   // in debug info about call sites.

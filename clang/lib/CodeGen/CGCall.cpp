@@ -5221,7 +5221,8 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
                                  llvm::CallBase **callOrInvoke, bool IsMustTail,
                                  SourceLocation Loc,
                                  bool IsVirtualFunctionPointerThunk,
-                                 QualType HeapAllocSiteType) {
+                                 QualType HeapAllocSiteType,
+                                 int HeapAllocSiteTypeArg) {
   // FIXME: We no longer need the types from CallArgs; lift up and simplify.
 
   assert(Callee.isOrdinary() || Callee.isVirtual());
@@ -5999,6 +6000,9 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
       // site address.
       if (llvm::CallInst *CallI = dyn_cast<llvm::CallInst>(CI))
         CallI->setTailCallKind(llvm::CallInst::TCK_NoTail);
+    }
+    if (HeapAllocSiteTypeArg != -1) {
+      getDebugInfo()->addHeapAllocSiteArgMetadata(CI, HeapAllocSiteTypeArg);
     }
   }
 
