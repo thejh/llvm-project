@@ -13321,6 +13321,7 @@ bool IntExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
 
   case Builtin::BI__builtin_expect:
   case Builtin::BI__builtin_expect_with_probability:
+  case Builtin::BI__builtin_size_type_hint:
     return Visit(E->getArg(0));
 
   case Builtin::BI__builtin_ptrauth_string_discriminator: {

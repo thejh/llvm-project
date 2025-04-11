@@ -6348,6 +6348,10 @@ static std::pair<QualType,int> InferTypeFromSizeExpr(ASTContext &Ctx, const Expr
         }
       }
     }
+  } else if (const CallExpr *CE = dyn_cast<CallExpr>(E)) {
+    if (CE->getBuiltinCallee() == Builtin::BI__builtin_size_type_hint && CE->getNumArgs() >= 2) {
+      return InferTypeFromSizeExpr(Ctx, CE->getArg(1));
+    }
   }
   return std::make_pair<>(QualType(), -1);
 }

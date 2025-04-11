@@ -365,6 +365,10 @@ public:
     case Builtin::BI__builtin_unpredictable:
       return Visit(CE->getArg(0));
 
+    case Builtin::BI__builtin_size_type_hint:
+      assert(CE->getNumArgs() >= 1);
+      return Visit(CE->getArg(0));
+
     default:
       return nullptr;
     }

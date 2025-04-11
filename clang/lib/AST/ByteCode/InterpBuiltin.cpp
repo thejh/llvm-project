@@ -2494,6 +2494,7 @@ bool InterpretBuiltin(InterpState &S, CodePtr OpPC, const CallExpr *Call,
 
   case Builtin::BI__builtin_expect:
   case Builtin::BI__builtin_expect_with_probability:
+  case Builtin::BI__builtin_size_type_hint:/*TODO hack*/
     return interp__builtin_expect(S, OpPC, Frame, Call);
 
   case Builtin::BI__builtin_rotateleft8:

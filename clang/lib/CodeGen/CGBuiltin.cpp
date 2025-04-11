@@ -3464,6 +3464,11 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     // to instructions such as branches or switches that use it.
     return RValue::get(EmitScalarExpr(E->getArg(0)));
   }
+  case Builtin::BI__builtin_size_type_hint: {
+    // This builtin is a pure C-level annotation, get rid of it when lowering to
+    // IR.
+    return RValue::get(EmitScalarExpr(E->getArg(0)));
+  }
   case Builtin::BI__builtin_expect: {
     Value *ArgValue = EmitScalarExpr(E->getArg(0));
     llvm::Type *ArgType = ArgValue->getType();

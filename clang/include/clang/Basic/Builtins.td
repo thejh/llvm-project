@@ -5175,3 +5175,9 @@ def CountedByRef : Builtin {
   let Attributes = [NoThrow, CustomTypeChecking];
   let Prototype = "int(...)";
 }
+
+def SizeTypeHint : Builtin {
+  let Spellings = ["__builtin_size_type_hint"];
+  let Attributes = [NoThrow, Const, Constexpr];
+  let Prototype = "size_t(size_t, size_t)";
+}
