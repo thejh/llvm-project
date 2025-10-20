@@ -76,6 +76,7 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizerOptions.h"
 #include "llvm/Transforms/Utils/ASanStackFrameLayout.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/EscapeEnumerator.h"
 #include "llvm/Transforms/Utils/Instrumentation.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
@@ -435,6 +436,10 @@ static cl::opt<AsanDtorKind> ClOverrideDestructorKind(
                clEnumValN(AsanDtorKind::Global, "global",
                           "Use global destructors")),
     cl::init(AsanDtorKind::Invalid), cl::Hidden);
+
+static cl::opt<bool>
+    ClEntryExitHooks("asan-entry-exit-hooks",
+                      cl::desc("Place ASan hooks on function entry and exit"));
 
 // Debug flags.
 
@@ -906,6 +911,10 @@ private:
   FunctionCallee AMDGPUAddressPrivate;
   int InstrumentationWithCallsThreshold;
   uint32_t MaxInlinePoisoningSize;
+
+  // for fast stack trace collection
+  FunctionCallee AsanFuncEntry;
+  FunctionCallee AsanFuncExit;
 };
 
 class ModuleAddressSanitizer {
@@ -2920,6 +2929,12 @@ void AddressSanitizer::initializeCallbacks(const TargetLibraryInfo *TLI) {
       M.getOrInsertFunction(kAMDGPUAddressSharedName, IRB.getInt1Ty(), PtrTy);
   AMDGPUAddressPrivate =
       M.getOrInsertFunction(kAMDGPUAddressPrivateName, IRB.getInt1Ty(), PtrTy);
+
+  AttributeList EEFuncAttr;
+  EEFuncAttr = EEFuncAttr.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+  EEFuncAttr = EEFuncAttr.addFnAttribute(M.getContext(), Attribute::NoInline);
+  AsanFuncEntry = M.getOrInsertFunction("__asan_func_entry", EEFuncAttr, IRB.getVoidTy());
+  AsanFuncExit = M.getOrInsertFunction("__asan_func_exit", EEFuncAttr, IRB.getVoidTy());
 }
 
 bool AddressSanitizer::maybeInsertAsanInitAtFunctionEntry(Function &F) {
@@ -3158,6 +3173,20 @@ bool AddressSanitizer::instrumentFunction(Function &F,
 
   if (ChangedStack || !NoReturnCalls.empty())
     FunctionModified = true;
+
+  if (ClEntryExitHooks) {
+    InstrumentationIRBuilder IRB(&F.getEntryBlock(),
+                                 F.getEntryBlock().getFirstNonPHIIt());
+    CallInst *FEnCI = IRB.CreateCall(AsanFuncEntry, {});
+    FEnCI->setTailCallKind(CallInst::TCK_NoTail);
+    EscapeEnumerator EE(F, "asan_cleanup", true);
+    while (IRBuilder<> *AtExit = EE.Next()) {
+      InstrumentationIRBuilder::ensureDebugInfo(*AtExit, F);
+      CallInst *FExCI = AtExit->CreateCall(AsanFuncExit, {});
+      FExCI->setTailCallKind(CallInst::TCK_NoTail);
+    }
+    FunctionModified = true;
+  }
 
   LLVM_DEBUG(dbgs() << "ASAN done instrumenting: " << FunctionModified << " "
                     << F << "\n");
